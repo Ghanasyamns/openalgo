@@ -24,7 +24,13 @@ import pytz
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from database.auth_db import get_auth_token_broker
-from database.sandbox_db import SandboxOrders, SandboxPositions, SandboxTrades, db_session
+from database.sandbox_db import (
+    SandboxHoldings,
+    SandboxOrders,
+    SandboxPositions,
+    SandboxTrades,
+    db_session,
+)
 from database.token_db import get_symbol_info
 from sandbox.fund_manager import FundManager, reconcile_margin, validate_margin_consistency
 from services.quotes_service import get_multiquotes, get_quotes
@@ -206,16 +212,19 @@ class ExecutionEngine:
         return quote_cache
 
     def _publish_fill_event(
-        self, orderid, tradeid, symbol, exchange, action, quantity, price, product, strategy
+        self, orderid, tradeid, symbol, exchange, action, quantity, price, product, strategy,
+        user_id=None, pricetype="", trigger_price=0.0,
     ):
-        """Emit SandboxOrderFilledEvent so the analyzer-mode UI auto-refreshes.
+        """Emit SandboxOrderFilledEvent so the analyzer-mode UI auto-refreshes,
+        and OrderUpdateEvent so the real-time order-update channel (socketio +
+        websocket_proxy relay) picks it up too.
 
         Logged at INFO so it's visible in server logs and confirms the
         event-bus path was reached (any breakage in registration or imports
         would suppress the log too).
         """
         try:
-            from events import SandboxOrderFilledEvent
+            from events import OrderUpdateEvent, SandboxOrderFilledEvent
             from utils.event_bus import bus
 
             bus.publish(
@@ -231,6 +240,27 @@ class ExecutionEngine:
                     price=price,
                     product=product,
                     strategy=strategy,
+                )
+            )
+            bus.publish(
+                OrderUpdateEvent(
+                    mode="analyze",
+                    api_type="sandbox.fill",
+                    request_data={"user_id": user_id} if user_id else {},
+                    broker="sandbox",
+                    orderid=orderid,
+                    symbol=symbol,
+                    exchange=exchange,
+                    action=action,
+                    quantity=quantity,
+                    price=price,
+                    pricetype=pricetype,
+                    trigger_price=trigger_price,
+                    product=product,
+                    order_status="complete",
+                    filled_quantity=quantity,
+                    pending_quantity=0,
+                    average_price=price,
                 )
             )
             logger.info(
@@ -278,6 +308,9 @@ class ExecutionEngine:
                         price=float(existing_trade.price),
                         product=order.product,
                         strategy=order.strategy or "",
+                        user_id=order.user_id,
+                        pricetype=order.price_type or "",
+                        trigger_price=float(order.trigger_price or 0),
                     )
                 return
 
@@ -404,6 +437,9 @@ class ExecutionEngine:
                 price=float(execution_price),
                 product=order.product,
                 strategy=order.strategy or "",
+                user_id=order.user_id,
+                pricetype=order.price_type or "",
+                trigger_price=float(order.trigger_price or 0),
             )
 
         except Exception as e:
@@ -411,13 +447,49 @@ class ExecutionEngine:
             logger.exception(f"Error executing order {order.orderid}: {e}")
 
             # Mark order as rejected
+            rejection_reason = f"Execution error: {str(e)}"
             try:
                 order.order_status = "rejected"
-                order.rejection_reason = f"Execution error: {str(e)}"
+                order.rejection_reason = rejection_reason
                 order.update_timestamp = datetime.now(pytz.timezone("Asia/Kolkata"))
                 db_session.commit()
             except Exception:
                 db_session.rollback()
+
+            self._publish_order_update_event(
+                order, order_status="rejected", rejection_reason=rejection_reason
+            )
+
+    def _publish_order_update_event(self, order, order_status, rejection_reason=""):
+        """Publish OrderUpdateEvent for a sandbox order transition that isn't
+        a fill (rejection, cancellation) — mirrors _publish_fill_event's
+        never-break-the-caller error isolation.
+        """
+        try:
+            from events import OrderUpdateEvent
+            from utils.event_bus import bus
+
+            bus.publish(
+                OrderUpdateEvent(
+                    mode="analyze",
+                    api_type="sandbox.order_update",
+                    request_data={"user_id": order.user_id} if order.user_id else {},
+                    broker="sandbox",
+                    orderid=order.orderid,
+                    symbol=order.symbol,
+                    exchange=order.exchange,
+                    action=order.action,
+                    quantity=int(order.quantity),
+                    price=float(order.price or 0),
+                    pricetype=order.price_type or "",
+                    trigger_price=float(order.trigger_price or 0),
+                    product=order.product,
+                    order_status=order_status,
+                    rejection_reason=rejection_reason,
+                )
+            )
+        except Exception as pub_err:
+            logger.debug(f"Failed to publish OrderUpdateEvent for {order.orderid}: {pub_err}")
 
     def _update_position(self, order, execution_price):
         """
@@ -430,6 +502,20 @@ class ExecutionEngine:
         """
         try:
             fund_manager = FundManager(order.user_id)
+
+            # Quantity that impacts the intraday position book. For a CNC SELL,
+            # any shares beyond an open long position are sold from settled
+            # holdings — reduce the holding directly (crediting the sale
+            # proceeds) instead of opening a phantom short position the user can
+            # never square off (issue #1640).
+            effective_qty = order.quantity
+            if order.product == "CNC" and order.action == "SELL":
+                effective_qty = self._settle_cnc_sell_from_holdings(
+                    order, execution_price, fund_manager
+                )
+                if effective_qty <= 0:
+                    # Fully settled from holdings — no position to create/update.
+                    return
 
             # Check if position exists
             position = SandboxPositions.query.filter_by(
@@ -452,7 +538,7 @@ class ExecutionEngine:
                     symbol=order.symbol,
                     exchange=order.exchange,
                     product=order.product,
-                    quantity=order.quantity if order.action == "BUY" else -order.quantity,
+                    quantity=effective_qty if order.action == "BUY" else -effective_qty,
                     average_price=execution_price,
                     ltp=execution_price,
                     pnl=Decimal("0.00"),
@@ -469,7 +555,7 @@ class ExecutionEngine:
             else:
                 # Update existing position (netting logic)
                 old_quantity = position.quantity
-                new_quantity = order.quantity if order.action == "BUY" else -order.quantity
+                new_quantity = effective_qty if order.action == "BUY" else -effective_qty
                 final_quantity = old_quantity + new_quantity
 
                 # Special case: Reopening a closed position (old_quantity = 0)
@@ -676,6 +762,71 @@ class ExecutionEngine:
             db_session.rollback()
             logger.exception(f"Error updating position for order {order.orderid}: {e}")
             raise
+
+    def _settle_cnc_sell_from_holdings(self, order, execution_price, fund_manager):
+        """Settle the holdings-backed portion of a CNC SELL (issue #1640).
+
+        Shares sold beyond any open long intraday position come from settled
+        holdings: reduce the holding and credit the sale proceeds to available
+        balance (mirrors T+1 settlement's reduce-holding accounting). This
+        prevents a phantom short position from being opened for shares the user
+        actually owns — which previously left the holding unsellable.
+
+        Args:
+            order: the filled SELL order (needs user_id/symbol/exchange/quantity)
+            execution_price: Decimal fill price
+            fund_manager: FundManager for the user
+
+        Returns:
+            int: quantity still to net against the open position (0 if fully from holdings)
+        """
+        position = SandboxPositions.query.filter_by(
+            user_id=order.user_id,
+            symbol=order.symbol,
+            exchange=order.exchange,
+            product=order.product,
+        ).first()
+        open_long_qty = position.quantity if (position and position.quantity > 0) else 0
+
+        # Draw from holdings only for the part an open long position can't cover.
+        from_holdings = order.quantity - open_long_qty
+        if from_holdings <= 0:
+            return order.quantity  # fully covered by the open long position
+
+        holding = SandboxHoldings.query.filter_by(
+            user_id=order.user_id, symbol=order.symbol, exchange=order.exchange
+        ).first()
+        if not holding or holding.quantity <= 0:
+            # No holdings to draw from. Order validation already blocks a CNC sell
+            # beyond position + holdings, so leave the remainder to the position
+            # logic rather than silently swallowing quantity here.
+            return order.quantity
+
+        reduce_qty = min(from_holdings, holding.quantity)
+        holding.quantity -= reduce_qty
+        holding.updated_at = datetime.now(pytz.timezone("Asia/Kolkata"))
+
+        # Credit sale proceeds to available balance (holdings carry no blocked
+        # margin — it was transferred out at T+1 settlement).
+        proceeds = Decimal(str(reduce_qty)) * execution_price
+        fund_manager.credit_sale_proceeds(
+            proceeds,
+            f"CNC SELL from holdings: {order.symbol} x{reduce_qty} @ {execution_price}",
+        )
+
+        if holding.quantity == 0:
+            db_session.delete(holding)
+            logger.info(f"Holdings fully sold: {order.symbol} x{reduce_qty}, proceeds ₹{proceeds}")
+        else:
+            logger.info(
+                f"Reduced holdings on CNC SELL: {order.symbol} by {reduce_qty} → "
+                f"{holding.quantity}, proceeds ₹{proceeds}"
+            )
+
+        db_session.commit()
+
+        # Remaining quantity nets against the open long position (may be 0).
+        return order.quantity - reduce_qty
 
     def _calculate_realized_pnl(self, old_quantity, avg_price, close_quantity, close_price, contract_value=1.0):
         """Calculate realized P&L for closed positions, multiplied by contract_value (e.g. 0.01 for ETHUSD.P)."""
